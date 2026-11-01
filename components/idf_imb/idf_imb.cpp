@@ -27,58 +27,84 @@ static constexpr size_t MAX_RESPONSE_BYTES = 1400;
 static constexpr size_t MIN_LARGEST_FREE_BLOCK = 36 * 1024;
 static constexpr int RESULT_REPORT_ATTEMPTS = 3;
 
-// 只走 WiFi：轮询频繁，走蜂窝会持续消耗卡上流量
-static bool http_get(const std::string& url, const std::string& token, std::string& body, int& status)
-{
-    esp_http_client_config_t cfg = {};
-    cfg.url = url.c_str();
-    cfg.timeout_ms = HTTP_TIMEOUT_MS;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.keep_alive_enable = false;
-    cfg.buffer_size_tx = 1024;
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return false;
-    esp_http_client_set_header(client, "X-SIM-Device-Token", token.c_str());
+// 复用同一条 TLS 连接：每 15 秒重新握手既耗 CPU，又会持续消耗和打碎堆，
+// 把为低频推送设计的内存余量拖垮。只走 WiFi，轮询走蜂窝会持续消耗卡上流量。
+static esp_http_client_handle_t s_client = nullptr;
+static std::string s_response;
 
-    bool ok = false;
-    body.clear();
-    if (esp_http_client_open(client, 0) == ESP_OK && esp_http_client_fetch_headers(client) >= 0) {
-        status = esp_http_client_get_status_code(client);
-        char buf[256];
-        ok = true;
-        while (body.size() < MAX_RESPONSE_BYTES) {
-            int read = esp_http_client_read(client, buf, sizeof(buf));
-            if (read < 0) {
-                ok = false;
-                break;
-            }
-            if (read == 0) break;
-            body.append(buf, static_cast<size_t>(read));
-        }
+static esp_err_t on_http_event(esp_http_client_event_t* event)
+{
+    if (event->event_id == HTTP_EVENT_ON_DATA && s_response.size() < MAX_RESPONSE_BYTES) {
+        s_response.append(static_cast<const char*>(event->data), event->data_len);
     }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    return ok;
+    return ESP_OK;
 }
 
-static bool http_post_json(const std::string& url, const std::string& token, const std::string& json, int& status)
+static void close_client(void)
 {
+    if (!s_client) return;
+    esp_http_client_cleanup(s_client);
+    s_client = nullptr;
+}
+
+static bool open_client(const std::string& url)
+{
+    if (s_client) return true;
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
     cfg.timeout_ms = HTTP_TIMEOUT_MS;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.keep_alive_enable = false;
+    cfg.keep_alive_enable = true;
     cfg.buffer_size_tx = 1024;
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return false;
-    esp_http_client_set_method(client, HTTP_METHOD_POST);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "X-SIM-Device-Token", token.c_str());
-    esp_http_client_set_post_field(client, json.c_str(), json.size());
-    esp_err_t err = esp_http_client_perform(client);
-    status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-    return err == ESP_OK;
+    cfg.event_handler = on_http_event;
+    s_client = esp_http_client_init(&cfg);
+    return s_client != nullptr;
+}
+
+// 请求失败时丢弃连接，下一轮重新建立（服务器关闭空闲连接属于正常情况）
+static bool http_request(const std::string& url, const std::string& token, const std::string* json,
+                         std::string& body, int& status)
+{
+    status = 0;
+    body.clear();
+    if (!open_client(url)) return false;
+    s_response.clear();
+    esp_http_client_set_url(s_client, url.c_str());
+    esp_http_client_set_header(s_client, "X-SIM-Device-Token", token.c_str());
+    if (json) {
+        esp_http_client_set_method(s_client, HTTP_METHOD_POST);
+        esp_http_client_set_header(s_client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(s_client, json->c_str(), json->size());
+    } else {
+        esp_http_client_set_method(s_client, HTTP_METHOD_GET);
+        esp_http_client_delete_header(s_client, "Content-Type");
+        esp_http_client_set_post_field(s_client, nullptr, 0);
+    }
+    esp_err_t err = esp_http_client_perform(s_client);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "request failed: %s", esp_err_to_name(err));
+        close_client();
+        return false;
+    }
+    status = esp_http_client_get_status_code(s_client);
+    body.swap(s_response);
+    return true;
+}
+
+// 暂停原因只在变化时写日志，避免每 15 秒刷屏；原因为空表示正常运行。
+static void note_pause(std::string& current, const std::string& reason)
+{
+    if (current == reason) return;
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    if (reason.empty()) {
+        idf_logf("IMB 发件轮询恢复（空闲堆 %u，最大块 %u）", static_cast<unsigned>(free_heap),
+                 static_cast<unsigned>(largest));
+    } else {
+        idf_logf("IMB 发件轮询暂停: %s（空闲堆 %u，最大块 %u）", reason.c_str(),
+                 static_cast<unsigned>(free_heap), static_cast<unsigned>(largest));
+    }
+    current = reason;
 }
 
 static bool find_endpoint(IdfImbEndpoint& out)
@@ -101,7 +127,8 @@ static void report_result(const IdfImbEndpoint& ep, const std::string& task_id, 
                        ",\"message\":\"" + idf_imb_json_escape(message) + "\"}";
     for (int attempt = 1; attempt <= RESULT_REPORT_ATTEMPTS; ++attempt) {
         int status = 0;
-        if (http_post_json(url, ep.token, json, status) && status >= 200 && status < 300) return;
+        std::string body;
+        if (http_request(url, ep.token, &json, body, status) && status >= 200 && status < 300) return;
         vTaskDelay(pdMS_TO_TICKS(2000 * attempt));
     }
     idf_log_line("IMB 发件结果回报失败，IMB 上该任务将按超时处理");
@@ -122,20 +149,34 @@ static void imb_task(void*)
     uint32_t delay_ms = POLL_INTERVAL_MS;
     uint32_t backoff_ms = POLL_INTERVAL_MS;
     bool logged_active = false;
+    std::string pause_reason;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
         delay_ms = POLL_INTERVAL_MS;
 
-        if (!idf_wifi_get_status().staConnected) continue;
+        if (!idf_wifi_get_status().staConnected) {
+            close_client();
+            note_pause(pause_reason, "WiFi 未连接");
+            continue;
+        }
         // 未注册网络时不取任务，留在 IMB 排队，比取走后立即失败更好
-        if (!idf_modem_get_status().modemReady) continue;
+        if (!idf_modem_get_status().modemReady) {
+            note_pause(pause_reason, "模组未注册网络");
+            continue;
+        }
 
         IdfImbEndpoint ep;
         if (!find_endpoint(ep)) {
+            close_client();
+            note_pause(pause_reason, "未启用 IMB 推送通道");
             delay_ms = NOT_CONFIGURED_RECHECK_MS;
             continue;
         }
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < MIN_LARGEST_FREE_BLOCK) continue;
+        // 已有连接时不需要再握手，只有新建连接才要求内存余量
+        if (!s_client && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < MIN_LARGEST_FREE_BLOCK) {
+            note_pause(pause_reason, "可用内存不足，推迟建立连接");
+            continue;
+        }
         if (!logged_active) {
             logged_active = true;
             idf_logf("IMB 发件轮询已启用: %s", ep.base.c_str());
@@ -144,13 +185,14 @@ static void imb_task(void*)
         std::string url = ep.base + "/api/v1/sim-sms/outbox/poll";
         std::string body;
         int status = 0;
-        if (!http_get(url, ep.token, body, status) || status >= 500) {
-            ESP_LOGW(TAG, "poll failed, status=%d", status);
+        if (!http_request(url, ep.token, nullptr, body, status) || status >= 500) {
+            note_pause(pause_reason, status ? "IMB 返回 HTTP " + std::to_string(status) : "连接 IMB 失败");
             backoff_ms = backoff_ms * 2 > POLL_MAX_BACKOFF_MS ? POLL_MAX_BACKOFF_MS : backoff_ms * 2;
             delay_ms = backoff_ms;
             continue;
         }
         backoff_ms = POLL_INTERVAL_MS;
+        note_pause(pause_reason, "");
         if (status == 401) {
             idf_log_line("IMB 发件轮询: 令牌无效或卡已停用，5 分钟后重试");
             delay_ms = UNAUTHORIZED_RECHECK_MS;
