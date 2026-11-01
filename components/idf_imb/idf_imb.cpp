@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "idf_config.h"
@@ -26,6 +27,9 @@ static constexpr size_t MAX_RESPONSE_BYTES = 1400;
 // 一次 TLS 握手约需 40KB 连续堆，余量不足时跳过本轮，不和短信转发抢内存
 static constexpr size_t MIN_LARGEST_FREE_BLOCK = 36 * 1024;
 static constexpr int RESULT_REPORT_ATTEMPTS = 3;
+// 每 20 次轮询（约 5 分钟）上报一次设备状态
+static constexpr int HEARTBEAT_EVERY_POLLS = 20;
+static constexpr int MODEM_VALUE_UNKNOWN = 999;
 
 // 复用同一条 TLS 连接：每 15 秒重新握手既耗 CPU，又会持续消耗和打碎堆，
 // 把为低频推送设计的内存余量拖垮。只走 WiFi，轮询走蜂窝会持续消耗卡上流量。
@@ -134,6 +138,72 @@ static void report_result(const IdfImbEndpoint& ep, const std::string& task_id, 
     idf_log_line("IMB 发件结果回报失败，IMB 上该任务将按超时处理");
 }
 
+static void add_text(std::string& json, const char* key, const std::string& value)
+{
+    if (value.empty()) return;
+    if (json.back() != '{') json += ",";
+    json += std::string("\"") + key + "\":\"" + idf_imb_json_escape(value) + "\"";
+}
+
+static void add_number(std::string& json, const char* key, long long value)
+{
+    if (json.back() != '{') json += ",";
+    json += std::string("\"") + key + "\":" + std::to_string(value);
+}
+
+static std::string heartbeat_json(void)
+{
+    const IdfModemStatus modem = idf_modem_get_status();
+    const IdfWifiStatus wifi = idf_wifi_get_status();
+
+    std::string status = "{";
+    if (modem.csq >= 0) add_number(status, "csq", modem.csq);
+    if (modem.rsrp != MODEM_VALUE_UNKNOWN) add_number(status, "rsrp", modem.rsrp);
+    if (modem.rsrq != MODEM_VALUE_UNKNOWN) add_number(status, "rsrq", modem.rsrq);
+    if (modem.sinr != MODEM_VALUE_UNKNOWN) add_number(status, "sinr", modem.sinr);
+    if (modem.ceregStat >= 0) add_number(status, "registration", modem.ceregStat);
+    add_text(status, "model", modem.model);
+    add_text(status, "modem_firmware", modem.fwver);
+    add_text(status, "firmware", IDF_FW_VERSION);
+    add_number(status, "uptime_seconds", esp_timer_get_time() / 1000000);
+    add_number(status, "free_heap", static_cast<long long>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    add_number(status, "largest_block", static_cast<long long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    add_number(status, "wifi_rssi", wifi.rssi);
+    add_text(status, "wifi_ip", wifi.ip);
+    status += "}";
+
+    std::string signal;
+    if (modem.rsrp != MODEM_VALUE_UNKNOWN) {
+        signal = std::to_string(modem.rsrp) + " dBm";
+    } else if (modem.csq >= 0) {
+        signal = "CSQ " + std::to_string(modem.csq);
+    }
+
+    std::string json = "{";
+    add_text(json, "signal", signal);
+    add_text(json, "carrier", modem.operatorName);
+    add_text(json, "phone_number", modem.phone);
+    add_text(json, "iccid", modem.iccid);
+    add_text(json, "imsi", modem.imsi);
+    add_text(json, "imei", modem.imei);
+    add_text(json, "apn", modem.apnSim);
+    if (json.back() != '{') json += ",";
+    json += "\"status\":" + status + "}";
+    return json;
+}
+
+// 心跳失败不影响发短信，也不重试，下个周期再报
+static void send_heartbeat(const IdfImbEndpoint& ep)
+{
+    const std::string json = heartbeat_json();
+    std::string body;
+    int status = 0;
+    if (!http_request(ep.base + "/api/v1/sim-sms/heartbeat", ep.token, &json, body, status) ||
+        status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "heartbeat failed, status=%d", status);
+    }
+}
+
 static void handle_task(const IdfImbEndpoint& ep, const IdfImbTask& task)
 {
     idf_logf("IMB 发件任务: 目标 %s，长度 %u", task.phone.c_str(),
@@ -149,6 +219,7 @@ static void imb_task(void*)
     uint32_t delay_ms = POLL_INTERVAL_MS;
     uint32_t backoff_ms = POLL_INTERVAL_MS;
     bool logged_active = false;
+    int polls_until_heartbeat = 2;
     std::string pause_reason;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
@@ -198,6 +269,16 @@ static void imb_task(void*)
             delay_ms = UNAUTHORIZED_RECHECK_MS;
             continue;
         }
+
+        // 信号平时不采样：提前一轮请求刷新，下一轮再发，上报的才是新值
+        if (polls_until_heartbeat == 1) idf_modem_note_status_interest();
+        if (polls_until_heartbeat == 0) {
+            send_heartbeat(ep);
+            polls_until_heartbeat = HEARTBEAT_EVERY_POLLS;
+        } else {
+            --polls_until_heartbeat;
+        }
+
         if (status != 200 || body.empty()) continue;
 
         IdfImbTask task;

@@ -79,6 +79,8 @@ esp_err_t idf_modem_get_operator(std::string& name);
 bool idf_modem_at_idle(void);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
 void idf_modem_request_status_sample(void);
+// 让模组任务按“有人在看”的节奏采样信号，不写日志，供后台定时上报使用。
+void idf_modem_note_status_interest(void);
 // 重申短信存储选择(CPMS MT→ME→SM)：短信任务随 CMGF/CNMI 周期重申一起调用，
 // 覆盖"模组自发复位后存储回落默认值、短信无处可存"的静默失效
 void idf_modem_reassert_sms_storage(void);

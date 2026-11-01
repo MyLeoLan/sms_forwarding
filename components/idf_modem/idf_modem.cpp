@@ -3051,6 +3051,11 @@ void idf_modem_request_status_sample(void)
     if (!already_pending) idf_log_line("模组信息刷新已排队，等待 AT 通道就绪且空闲");
 }
 
+void idf_modem_note_status_interest(void)
+{
+    s_last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
+}
+
 void idf_modem_begin_esim_operation(void)
 {
     s_esim_operation_depth.fetch_add(1, std::memory_order_relaxed);
