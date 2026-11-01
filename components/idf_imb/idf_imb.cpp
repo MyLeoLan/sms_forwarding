@@ -28,7 +28,7 @@ static constexpr size_t MIN_LARGEST_FREE_BLOCK = 36 * 1024;
 static constexpr int RESULT_REPORT_ATTEMPTS = 3;
 
 // 只走 WiFi：轮询频繁，走蜂窝会持续消耗卡上流量
-static bool http_get(const std::string& url, std::string& body, int& status)
+static bool http_get(const std::string& url, const std::string& token, std::string& body, int& status)
 {
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
@@ -38,6 +38,7 @@ static bool http_get(const std::string& url, std::string& body, int& status)
     cfg.buffer_size_tx = 1024;
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return false;
+    esp_http_client_set_header(client, "X-SIM-Device-Token", token.c_str());
 
     bool ok = false;
     body.clear();
@@ -60,7 +61,7 @@ static bool http_get(const std::string& url, std::string& body, int& status)
     return ok;
 }
 
-static bool http_post_json(const std::string& url, const std::string& json, int& status)
+static bool http_post_json(const std::string& url, const std::string& token, const std::string& json, int& status)
 {
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
@@ -72,6 +73,7 @@ static bool http_post_json(const std::string& url, const std::string& json, int&
     if (!client) return false;
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-SIM-Device-Token", token.c_str());
     esp_http_client_set_post_field(client, json.c_str(), json.size());
     esp_err_t err = esp_http_client_perform(client);
     status = esp_http_client_get_status_code(client);
@@ -94,12 +96,12 @@ static bool find_endpoint(IdfImbEndpoint& out)
 static void report_result(const IdfImbEndpoint& ep, const std::string& task_id, bool success,
                           const std::string& message)
 {
-    std::string url = ep.base + "/api/v1/sim-sms/outbox/" + task_id + "/result?token=" + ep.token;
+    std::string url = ep.base + "/api/v1/sim-sms/outbox/" + task_id + "/result";
     std::string json = std::string("{\"success\":") + (success ? "true" : "false") +
                        ",\"message\":\"" + idf_imb_json_escape(message) + "\"}";
     for (int attempt = 1; attempt <= RESULT_REPORT_ATTEMPTS; ++attempt) {
         int status = 0;
-        if (http_post_json(url, json, status) && status >= 200 && status < 300) return;
+        if (http_post_json(url, ep.token, json, status) && status >= 200 && status < 300) return;
         vTaskDelay(pdMS_TO_TICKS(2000 * attempt));
     }
     idf_log_line("IMB 发件结果回报失败，IMB 上该任务将按超时处理");
@@ -139,10 +141,10 @@ static void imb_task(void*)
             idf_logf("IMB 发件轮询已启用: %s", ep.base.c_str());
         }
 
-        std::string url = ep.base + "/api/v1/sim-sms/outbox/poll?token=" + ep.token;
+        std::string url = ep.base + "/api/v1/sim-sms/outbox/poll";
         std::string body;
         int status = 0;
-        if (!http_get(url, body, status) || status >= 500) {
+        if (!http_get(url, ep.token, body, status) || status >= 500) {
             ESP_LOGW(TAG, "poll failed, status=%d", status);
             backoff_ms = backoff_ms * 2 > POLL_MAX_BACKOFF_MS ? POLL_MAX_BACKOFF_MS : backoff_ms * 2;
             delay_ms = backoff_ms;
