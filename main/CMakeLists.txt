@@ -6,6 +6,7 @@ idf_component_register(
     esp_netif
     idf_config
     idf_esim
+    idf_imb
     idf_inbox
     idf_logbuf
     idf_modem

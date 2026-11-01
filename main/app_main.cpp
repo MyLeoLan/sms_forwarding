@@ -4,6 +4,7 @@
 #include "esp_event.h"
 #include "idf_config.h"
 #include "idf_esim.h"
+#include "idf_imb.h"
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
@@ -76,4 +77,5 @@ extern "C" void app_main(void)
     log_start_result("HTTP 服务器", idf_web_start());
     log_start_result("模组", idf_modem_start(idf_config_get()));
     log_start_result("短信接收", idf_sms_start());
+    log_start_result("IMB 发件轮询", idf_imb_start());
 }

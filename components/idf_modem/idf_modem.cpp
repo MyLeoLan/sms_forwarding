@@ -48,6 +48,13 @@ static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
 static constexpr uint32_t MODEM_RETRY_DELAYS_MS[] = {
     30000UL, 60000UL, 120000UL, 300000UL, 600000UL,
 };
+// 上电早期 SIM 仍在初始化时 CPIN 查询失败属正常现象：先等它稳定，之后短周期重试，
+// 不能直接落入上面的长退避，否则这段时间内注册探测、信号采样和掉网保护全部停摆。
+static constexpr uint32_t MODEM_SIM_SETTLE_MAX_MS = 20000UL;
+static constexpr uint32_t MODEM_SIM_FAST_RETRY_MS = 5000UL;
+static constexpr uint32_t MODEM_SIM_FAST_RETRY_WINDOW_MS = 180000UL;
+// 开机后迟迟未注册时自动软重启一次，等价于手动执行“系统设置 → 4G 模组 → 软重启”。
+static constexpr uint32_t MODEM_BOOT_REG_RECOVERY_MS = 90000UL;
 static constexpr size_t MODEM_RETRY_DELAY_COUNT =
     sizeof(MODEM_RETRY_DELAYS_MS) / sizeof(MODEM_RETRY_DELAYS_MS[0]);
 
@@ -2421,6 +2428,34 @@ bool idf_modem_sms_health_check(std::string& summary)
     return false;
 }
 
+// 等 SIM 给出明确状态再做就绪判断；无卡的板子只多等一次，不影响后续流程。
+static void wait_sim_settled(void)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickDeadline deadline(MODEM_SIM_SETTLE_MAX_MS);
+    std::string state = query_sim_state();
+    while (state != "ready" && state != "pin" && state != "puk" && !deadline.expired()) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        state = query_sim_state();
+    }
+    idf_logf("SIM 启动等待 %u ms，状态 %s",
+             static_cast<unsigned>(pdTICKS_TO_MS(xTaskGetTickCount() - start)), state.c_str());
+}
+
+static void log_registration_diagnostics(void)
+{
+    static const char* const kCommands[] = {"AT+CPIN?", "AT+CFUN?", "AT+CEREG?", "AT+CSQ", "AT+COPS?"};
+    for (const char* cmd : kCommands) {
+        std::string resp;
+        send_ok(cmd, 1500, &resp);
+        std::replace_if(resp.begin(), resp.end(), [](unsigned char ch) {
+            return ch == '\r' || ch == '\n';
+        }, ' ');
+        if (resp.size() > 96) resp.resize(96);
+        idf_logf("开机注册诊断 %s -> %s", cmd, resp.c_str());
+    }
+}
+
 // 锁 PIN/PUK 的 SIM 仍然在位，热插拔检测不能把它当成拔卡并触发重启循环。
 static bool query_sim_present(void)
 {
@@ -2468,6 +2503,7 @@ static bool handle_reset_request_if_any(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
+    wait_sim_settled();
     if (try_unlock_sim(false)) {
         configure_sms_and_registration();
         set_phase("registering");
@@ -2556,8 +2592,10 @@ static void modem_task(void*)
     ESP_LOGI(TAG, "AT 已就绪");
     idf_log_line("模组 AT 已就绪");
 
+    wait_sim_settled();
     bool sim_ready = try_unlock_sim(false);
     TickType_t last_sim_unlock_check = xTaskGetTickCount();
+    TickType_t sim_fast_retry_start = last_sim_unlock_check;
     uint8_t sim_unlock_retry_level = 0;
     if (sim_ready) {
         configure_sms_and_registration();
@@ -2612,10 +2650,16 @@ static void modem_task(void*)
     int64_t sim_check_not_before_us = 0;  // 模组重启后给 SIM/CPIN 充分上电时间，避免误判二次拔插
     int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
+    bool sim_config_pending = false;       // SIM 经采样路径转为就绪时，仍需补跑完整初始化
+    bool boot_recovery_used = false;       // 开机未注册的自动软重启只做一次
+    TickType_t boot_recovery_start = xTaskGetTickCount();
     while (true) {
         bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
-        if (!sim_ready && idf_modem_get_status().simState == "ready") sim_ready = true;
+        if (!sim_ready && idf_modem_get_status().simState == "ready") {
+            sim_ready = true;
+            sim_config_pending = true;
+        }
         TickType_t now = xTaskGetTickCount();
         if (reset_handled) {
             sim_ready = idf_modem_get_status().simState == "ready";
@@ -2630,7 +2674,9 @@ static void modem_task(void*)
             last_identity = 0;
             identity_retry_level = 0;
             last_sim_unlock_check = now;
+            sim_fast_retry_start = now;
             sim_unlock_retry_level = 0;
+            sim_config_pending = false;  // 重启流程已完成初始化
             last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
@@ -2649,9 +2695,15 @@ static void modem_task(void*)
                 sim_unlock_retry_level = 0;
             }
         }
+        const std::string sim_state_now = idf_modem_get_status().simState;
+        bool sim_state_transient = sim_state_now != "pin" && sim_state_now != "puk" &&
+                                   sim_state_now != "absent";
+        bool sim_fast_retry = sim_state_transient &&
+                              now - sim_fast_retry_start < pdMS_TO_TICKS(MODEM_SIM_FAST_RETRY_WINDOW_MS);
         bool sim_unlock_retry_due = !sim_ready &&
                                     now - last_sim_unlock_check >= pdMS_TO_TICKS(
-                                        modem_retry_delay_ms(sim_unlock_retry_level));
+                                        sim_fast_retry ? MODEM_SIM_FAST_RETRY_MS
+                                                       : modem_retry_delay_ms(sim_unlock_retry_level));
         if (!sim_unlock_checked && sim_unlock_retry_due && at_channel_idle_now()) {
             sim_ready = try_unlock_sim(false);
             sim_unlock_checked = true;
@@ -2662,7 +2714,8 @@ static void modem_task(void*)
                 ++sim_unlock_retry_level;
             }
         }
-        if (sim_unlock_checked && sim_ready && at_channel_idle_now()) {
+        if (((sim_unlock_checked && sim_ready) || sim_config_pending) && at_channel_idle_now()) {
+            sim_config_pending = false;
             configure_sms_and_registration();
             set_phase("registering");
             apply_startup_data_mode();
@@ -2792,6 +2845,17 @@ static void modem_task(void*)
                 idf_log_line("模组健康探测连续失败，触发硬重启恢复");
                 s_reset_request.store(2, std::memory_order_relaxed);
             }
+        }
+        // 兜底：开机 90 秒仍未注册且 SIM 并非无卡/锁卡，自动软重启一次，并留下诊断信息。
+        // 只针对开机后从未注册的情况；运行中掉网走下方约 5 分钟的硬重启恢复。
+        if (registered) boot_recovery_used = true;
+        if (!boot_recovery_used && !registered && sim_state_transient && sim_present != 0 &&
+            now - boot_recovery_start > pdMS_TO_TICKS(MODEM_BOOT_REG_RECOVERY_MS) &&
+            at_channel_idle_now()) {
+            boot_recovery_used = true;
+            idf_log_line("开机 90 秒未注册网络，自动软重启模组");
+            log_registration_diagnostics();
+            s_reset_request.store(1, std::memory_order_relaxed);
         }
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
         // 插入(无卡→有卡)：自动硬重启模组 + 作废旧身份，让新卡从干净状态初始化；

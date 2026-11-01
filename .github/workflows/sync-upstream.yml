@@ -1,0 +1,51 @@
+name: Sync Upstream
+
+# 每天把上游 master 合并到 imb 分支并触发编译；有冲突时任务失败，需要手工合并。
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: imb
+          fetch-depth: 0
+
+      - name: Merge upstream master
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/MineSunshineone/sms_forwarding.git
+          git fetch upstream master
+          # master 只做上游镜像，方便对比差异
+          git push origin refs/remotes/upstream/master:refs/heads/master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "已是最新，无需合并"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/master; then
+            git status --short
+            echo "::error::合并上游有冲突，请在本地解决后推送到 imb 分支"
+            exit 1
+          fi
+          git push origin imb
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN 的推送不会触发其他工作流，这里显式启动编译
+      - name: Trigger firmware build
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref imb
