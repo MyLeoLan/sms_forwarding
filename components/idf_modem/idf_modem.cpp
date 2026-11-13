@@ -70,6 +70,10 @@ static_assert(modem_retry_delay_ms(99) == 600000UL, "补采退避上限应为 10
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
+// 未注册时的射频守护间隔：部分 ML307A 运行中会自发落入 CFUN=0(射频与 SIM 均下电，
+// CPIN 报 +CME ERROR: 13)，且不会自行恢复；固件从不主动发 CFUN=0(飞行模式用的是 4)，
+// 因此检测到 0 即可安全拉回 1。
+static constexpr uint32_t MODEM_CFUN_GUARD_INTERVAL_MS = 15000UL;
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 
@@ -2456,11 +2460,46 @@ static void log_registration_diagnostics(void)
     }
 }
 
+// 查询 CFUN 模式；失败返回 -1
+static int query_cfun_mode(void)
+{
+    std::string resp;
+    if (!send_ok("AT+CFUN?", 3000, &resp)) return -1;
+    size_t p = resp.find("+CFUN:");
+    if (p == std::string::npos) return -1;
+    const char* s = resp.c_str() + p + strlen("+CFUN:");
+    while (*s == ' ') ++s;
+    if (*s < '0' || *s > '9') return -1;
+    return atoi(s);
+}
+
+// 射频守护：模组自发落入 CFUN=0 时拉回全功能。返回 true 表示执行了恢复。
+// 只处理 0：CFUN=4 是用户在网页主动开启的飞行模式，不能被自动撤销。
+static bool recover_radio_if_minimum(void)
+{
+    static uint32_t s_cfun_recover_count = 0;
+    int mode = query_cfun_mode();
+    if (mode != 0) return false;
+    ++s_cfun_recover_count;
+    idf_logf("检测到模组射频被关闭(CFUN=0，第 %u 次)，自动恢复 CFUN=1",
+             static_cast<unsigned>(s_cfun_recover_count));
+    if (!send_ok("AT+CFUN=1", 15000)) {
+        idf_log_line("恢复 CFUN=1 失败，交由后续掉网硬重启处理");
+        return false;
+    }
+    return true;
+}
+
 // 锁 PIN/PUK 的 SIM 仍然在位，热插拔检测不能把它当成拔卡并触发重启循环。
-static bool query_sim_present(void)
+// 只有明确的 +CME ERROR: 10(SIM not inserted) 才算无卡；13(SIM failure，CFUN=0 时
+// 必现)、14(busy)等返回 -1(未知)，调用方应保持原判断，否则会把"射频关闭"误当
+// 无卡，进而屏蔽开机软重启与掉网硬重启两道自动恢复。
+static int query_sim_present(void)
 {
     std::string state = query_sim_state();
-    return state != "absent" && state != "unknown";
+    if (state == "absent") return 0;
+    if (state == "unknown") return -1;
+    return 1;
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
@@ -2652,6 +2691,7 @@ static void modem_task(void*)
     bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
     bool sim_config_pending = false;       // SIM 经采样路径转为就绪时，仍需补跑完整初始化
     bool boot_recovery_used = false;       // 开机未注册的自动软重启只做一次
+    TickType_t last_cfun_guard = 0;        // 射频守护(CFUN=0 自动恢复)上次检查时刻
     TickType_t boot_recovery_start = xTaskGetTickCount();
     while (true) {
         bool reset_handled = handle_reset_request_if_any();
@@ -2846,6 +2886,22 @@ static void modem_task(void*)
                 s_reset_request.store(2, std::memory_order_relaxed);
             }
         }
+        // 射频守护：未注册期间每 15 秒查一次 CFUN，自发落入 0 时立即拉回 1。
+        // 不依赖 sim_ready——CFUN=0 时 SIM 已下电，sim_ready 可能已被置 false。
+        if (!registered && now - last_cfun_guard > pdMS_TO_TICKS(MODEM_CFUN_GUARD_INTERVAL_MS) &&
+            idf_modem_get_status().atReady && at_channel_idle_now()) {
+            last_cfun_guard = now;
+            if (recover_radio_if_minimum()) {
+                // SIM 重新上电后由解锁/健康探测路径接手，注册成功时重申短信配置
+                sms_reconfigure_pending = true;
+                sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
+                last_sim_unlock_check = 0;
+                sim_unlock_retry_level = 0;
+                sim_fast_retry_start = now;
+                last_health = 0;
+                dereg_count = 0;
+            }
+        }
         // 兜底：开机 90 秒仍未注册且 SIM 并非无卡/锁卡，自动软重启一次，并留下诊断信息。
         // 只针对开机后从未注册的情况；运行中掉网走下方约 5 分钟的硬重启恢复。
         if (registered) boot_recovery_used = true;
@@ -2865,8 +2921,17 @@ static void modem_task(void*)
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
-            int present_now = query_sim_present() ? 1 : 0;
-            if (sim_present == -1) {
+            int present_now = query_sim_present();
+            if (present_now < 0) {
+                // CPIN 无法判定(多为 CFUN=0 下的 SIM failure)：先尝试拉回射频，
+                // 不更新基线，也不当作插拔事件
+                if (recover_radio_if_minimum()) {
+                    last_cfun_guard = now;
+                    sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
+                    sms_reconfigure_pending = true;
+                    last_health = 0;
+                }
+            } else if (sim_present == -1) {
                 sim_present = present_now;  // 首次仅记基线，不当作插拔事件
             } else if (present_now != sim_present) {
                 sim_present = present_now;
