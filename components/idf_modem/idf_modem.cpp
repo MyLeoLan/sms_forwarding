@@ -1160,9 +1160,12 @@ esp_err_t idf_modem_get_operator(std::string& name)
     esp_err_t err = send("AT+COPS?");
     bool changed = false;
     if (err == ESP_OK) {
-        if (!parse_cops(response, original_format, oper) || original_format < 0) {
+        if (!parse_cops(response, original_format, oper)) {
             log_identity_response_shape("COPS", response, "+COPS:");
             err = ESP_FAIL;
+        } else if (original_format < 0) {
+            // 27.007 §7.3：未驻网时只回 <mode>，没有运营商可读，不是响应异常
+            err = ESP_ERR_NOT_FOUND;
         } else {
             name = cops_display(original_format, oper);
             if (name.empty() && original_format != 2) {
@@ -1200,7 +1203,11 @@ static std::string query_operator_from_modem(void)
 {
     std::string name;
     esp_err_t err = idf_modem_get_operator(name);
-    idf_logf("运营商查询 AT+COPS?: %s", err == ESP_OK ? "已读取" : esp_err_to_name(err));
+    if (err == ESP_ERR_NOT_FOUND) {
+        idf_log_line("运营商查询 AT+COPS?: 模组未驻网，暂无运营商");
+    } else {
+        idf_logf("运营商查询 AT+COPS?: %s", err == ESP_OK ? "已读取" : esp_err_to_name(err));
+    }
     return name;
 }
 
@@ -2507,6 +2514,47 @@ static int query_sim_present(void)
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
 static bool s_reinit_pending = false;
 
+// 自动硬重启退避：覆盖差/射频反复掉线时，重启并不能解决问题，连续重启只会让模组
+// 永远停在开机流程里。两次自动硬重启之间至少间隔 0、2、5、15、30、60 分钟（之后保持
+// 60 分钟）；一旦注册成功就清零。网页手动重启与每日体检不经过这里。
+static constexpr uint32_t kAutoResetGapMinutes[] = {0, 2, 5, 15, 30, 60};
+static int s_auto_reset_streak = 0;
+static int64_t s_last_auto_reset_us = 0;
+
+static uint32_t auto_reset_gap_ms(int streak)
+{
+    constexpr int count = sizeof(kAutoResetGapMinutes) / sizeof(kAutoResetGapMinutes[0]);
+    int index = streak < 0 ? 0 : (streak >= count ? count - 1 : streak);
+    return kAutoResetGapMinutes[index] * 60000UL;
+}
+
+static void note_registration_ok_for_auto_reset(void)
+{
+    s_auto_reset_streak = 0;
+}
+
+// 返回 true 表示已请求硬重启；false 表示处于退避期，本次跳过
+static bool request_auto_hard_reset(const char* reason)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t gap_us = static_cast<int64_t>(auto_reset_gap_ms(s_auto_reset_streak)) * 1000LL;
+    if (s_auto_reset_streak > 0 && now_us - s_last_auto_reset_us < gap_us) {
+        static int64_t s_last_skip_log_us = 0;
+        if (s_last_skip_log_us == 0 || now_us - s_last_skip_log_us > 60LL * 1000000LL) {
+            s_last_skip_log_us = now_us;
+            idf_logf("%s，但自动硬重启退避中（已连续 %d 次，%u 秒后才允许下一次）", reason,
+                     s_auto_reset_streak,
+                     static_cast<unsigned>((gap_us - (now_us - s_last_auto_reset_us)) / 1000000LL));
+        }
+        return false;
+    }
+    ++s_auto_reset_streak;
+    s_last_auto_reset_us = now_us;
+    idf_logf("%s，触发硬重启恢复（连续第 %d 次）", reason, s_auto_reset_streak);
+    s_reset_request.store(2, std::memory_order_relaxed);
+    return true;
+}
+
 static bool handle_reset_request_if_any(void)
 {
     // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；切卡成功后 idf_esim 请求的软重启
@@ -2841,6 +2889,7 @@ static void modem_task(void*)
                 if (now_ready) {
                     registered = true;
                     dereg_count = 0;
+                    note_registration_ok_for_auto_reset();
                     bool sms_reconfigured_now = false;
                     if (sms_reconfigure_pending) {
                         // CPIN READY 之后模组仍可能异步重建短信栈并回落默认设置；
@@ -2876,14 +2925,17 @@ static void modem_task(void*)
                         dereg_count = 0;
                     } else if (++dereg_count >= 60) {
                         dereg_count = 0;
-                        idf_log_line("模组长时间未注册网络，触发硬重启恢复");
-                        s_reset_request.store(2, std::memory_order_relaxed);
+                        request_auto_hard_reset("模组长时间未注册网络");
                     }
                 }
+            } else if (recover_radio_if_minimum()) {
+                // 射频被关(CFUN=0)时 CEREG 查询本就会失败：拉回射频即可，不算模组失联
+                health_fail_count = 0;
+                sms_reconfigure_pending = true;
+                last_cfun_guard = now;
             } else if (++health_fail_count >= 3) {
                 health_fail_count = 0;
-                idf_log_line("模组健康探测连续失败，触发硬重启恢复");
-                s_reset_request.store(2, std::memory_order_relaxed);
+                request_auto_hard_reset("模组健康探测连续失败");
             }
         }
         // 射频守护：未注册期间每 15 秒查一次 CFUN，自发落入 0 时立即拉回 1。
@@ -2935,17 +2987,25 @@ static void modem_task(void*)
                 sim_present = present_now;  // 首次仅记基线，不当作插拔事件
             } else if (present_now != sim_present) {
                 sim_present = present_now;
-                if (present_now == 1) {
+                if (present_now == 0 && recover_radio_if_minimum()) {
+                    // CFUN=0 会给 SIM 下电，部分固件此时回 CME ERROR 10；拉回射频后由下一轮
+                    // 检测重新判断，不当作拔卡，也就不会紧接着误判“插卡”再硬重启
+                    sim_present = 1;
+                    last_cfun_guard = now;
+                    sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
+                    sms_reconfigure_pending = true;
+                    last_health = 0;
+                } else if (present_now == 1) {
                     // 仅在 CPIN READY 时立即重发 CMGF/CNMI 不够可靠：部分 ML307 固件会在
                     // 换卡后继续异步重建协议栈，随后把短信模式恢复默认值。自动硬重启一次，
                     // 等价于用户手动断电恢复，同时保留“换卡无需重启 ESP32”的体验。
-                    idf_log_line("检测到 SIM 卡插入，自动硬重启模组以完整初始化短信栈");
                     idf_modem_invalidate_sim_identity();
                     registered = false;
                     post_register_done = false;
                     dereg_count = 0;
                     sms_reconfigure_pending = true;
-                    idf_modem_request_reset(true);
+                    // 真实换卡通常是第一次，不受退避影响；SIM 反复掉电重现时才会被限流
+                    request_auto_hard_reset("检测到 SIM 卡插入，自动硬重启模组以完整初始化短信栈");
                 } else {
                     idf_log_line("检测到 SIM 卡移除");
                     registered = false;

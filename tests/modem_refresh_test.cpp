@@ -12,7 +12,7 @@
 
 using esp_err_t = int;
 using TickType_t = uint32_t;
-constexpr int ESP_OK = 0, ESP_ERR_TIMEOUT = 1, ESP_FAIL = 2, ESP_ERR_INVALID_STATE = 3;
+constexpr int ESP_OK = 0, ESP_ERR_TIMEOUT = 1, ESP_FAIL = 2, ESP_ERR_INVALID_STATE = 3, ESP_ERR_NOT_FOUND = 4;
 #define pdMS_TO_TICKS(ms) (ms)
 int lock_depth = 0;
 bool lock_available = true, s_started = true;
@@ -229,7 +229,14 @@ void test_slow_operator()
     assert(manual_operator(message) && message == "CMCC");
     replies = {{"AT+COPS?", 1, ESP_OK, "+COPS: 0"}};
     reply_index = 0;
-    assert(!manual_operator(message) && message.find("无法读取") != std::string::npos);
+    assert(!manual_operator(message) && message.find("无法读取") != std::string::npos &&
+           message.find("模组未驻网") != std::string::npos);
+    // 只回 mode = 未驻网：单独返回 NOT_FOUND，不当响应异常，也不改写查询格式
+    reply_index = 0;
+    {
+        std::string name = "stale";
+        assert(idf_modem_get_operator(name) == ESP_ERR_NOT_FOUND && name.empty() && reply_index == 1);
+    }
     replies = {{"AT+COPS?", 1, ESP_OK, "+COPS: 0,0,\"\",7"},
                {"AT+COPS=3,2", 1, ESP_OK, "OK"},
                {"AT+COPS?", 1, ESP_OK, "+COPS: 0,2,\"\",7"},

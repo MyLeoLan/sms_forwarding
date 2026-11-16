@@ -66,8 +66,9 @@ static bool open_client(const std::string& url)
 }
 
 // 请求失败时丢弃连接，下一轮重新建立（服务器关闭空闲连接属于正常情况）
+// idle=true 表示模组未注册网络：只向 IMB 报到在线，服务端不分配发件任务
 static bool http_request(const std::string& url, const std::string& token, const std::string* json,
-                         std::string& body, int& status)
+                         std::string& body, int& status, bool idle = false)
 {
     status = 0;
     body.clear();
@@ -75,6 +76,11 @@ static bool http_request(const std::string& url, const std::string& token, const
     s_response.clear();
     esp_http_client_set_url(s_client, url.c_str());
     esp_http_client_set_header(s_client, "X-SIM-Device-Token", token.c_str());
+    if (idle) {
+        esp_http_client_set_header(s_client, "X-SIM-Poll-Idle", "1");
+    } else {
+        esp_http_client_delete_header(s_client, "X-SIM-Poll-Idle");
+    }
     if (json) {
         esp_http_client_set_method(s_client, HTTP_METHOD_POST);
         esp_http_client_set_header(s_client, "Content-Type", "application/json");
@@ -220,6 +226,7 @@ static void imb_task(void*)
     uint32_t backoff_ms = POLL_INTERVAL_MS;
     bool logged_active = false;
     int polls_until_heartbeat = 2;
+    bool last_modem_ready = false;
     std::string pause_reason;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
@@ -230,10 +237,12 @@ static void imb_task(void*)
             note_pause(pause_reason, "WiFi 未连接");
             continue;
         }
-        // 未注册网络时不取任务，留在 IMB 排队，比取走后立即失败更好
-        if (!idf_modem_get_status().modemReady) {
-            note_pause(pause_reason, "模组未注册网络");
-            continue;
+        // 未注册网络时仍然轮询报到（带 idle 标记，IMB 不分配任务、任务留在队列），
+        // 否则 IMB 看不到设备、只能显示离线，也收不到“未注册”的状态心跳。
+        const bool modem_ready = idf_modem_get_status().modemReady;
+        if (modem_ready != last_modem_ready) {
+            last_modem_ready = modem_ready;
+            polls_until_heartbeat = 0;  // 注册状态变化后尽快上报一次设备状态
         }
 
         IdfImbEndpoint ep;
@@ -256,14 +265,14 @@ static void imb_task(void*)
         std::string url = ep.base + "/api/v1/sim-sms/outbox/poll";
         std::string body;
         int status = 0;
-        if (!http_request(url, ep.token, nullptr, body, status) || status >= 500) {
+        if (!http_request(url, ep.token, nullptr, body, status, !modem_ready) || status >= 500) {
             note_pause(pause_reason, status ? "IMB 返回 HTTP " + std::to_string(status) : "连接 IMB 失败");
             backoff_ms = backoff_ms * 2 > POLL_MAX_BACKOFF_MS ? POLL_MAX_BACKOFF_MS : backoff_ms * 2;
             delay_ms = backoff_ms;
             continue;
         }
         backoff_ms = POLL_INTERVAL_MS;
-        note_pause(pause_reason, "");
+        note_pause(pause_reason, modem_ready ? "" : "模组未注册网络（仍向 IMB 报到，不取发件任务）");
         if (status == 401) {
             idf_log_line("IMB 发件轮询: 令牌无效或卡已停用，5 分钟后重试");
             delay_ms = UNAUTHORIZED_RECHECK_MS;
@@ -284,6 +293,12 @@ static void imb_task(void*)
         IdfImbTask task;
         if (!idf_imb_parse_task(body, task) || !idf_imb_task_id_valid(task.id)) {
             idf_log_line("IMB 发件轮询: 响应格式无效，已忽略");
+            continue;
+        }
+        if (!modem_ready) {
+            // 旧版 IMB 不认 idle 标记仍会分配任务：明确回报失败，不让任务卡在“发送中”
+            idf_log_line("IMB 发件任务: 模组未注册网络，回报失败");
+            report_result(ep, task.id, false, "模组未注册网络，未发送");
             continue;
         }
         handle_task(ep, task);

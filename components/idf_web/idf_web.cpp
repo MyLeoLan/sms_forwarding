@@ -1069,7 +1069,10 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     } else if (action == "operator") {
         esp_err_t err = idf_modem_get_operator(message);
         success = err == ESP_OK && !message.empty();
-        if (!success) message = std::string("无法读取当前驻网运营商: ") + esp_err_to_name(err);
+        if (!success) {
+            message = std::string("无法读取当前驻网运营商: ") +
+                      (err == ESP_ERR_NOT_FOUND ? "模组未驻网" : esp_err_to_name(err));
+        }
     } else if (action == "imei") {
         std::string imei;
         esp_err_t err = idf_modem_get_imei(imei);
