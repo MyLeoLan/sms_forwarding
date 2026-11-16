@@ -27,5 +27,5 @@ with tempfile.TemporaryDirectory(prefix='test-logup-', dir=ROOT / 'build') as te
     cpp = Path(temp) / 'test.cpp'
     binary = Path(temp) / 'test'
     cpp.write_text(fixture)
-    subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(binary)], check=True)
+    subprocess.run(['g++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-Wformat-truncation', str(cpp), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

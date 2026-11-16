@@ -327,7 +327,7 @@ void idf_log_line(const char* line)
         item.resize(end);
         item += "...";
     }
-    char stamp[24];
+    char stamp[64];  // 编译器按 int 最坏宽度估算，24 字节会触发 -Wformat-truncation
     format_log_time(stamp, sizeof(stamp));
     item.insert(0, stamp);
 

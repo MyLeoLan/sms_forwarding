@@ -44,7 +44,7 @@ static void push(const std::string& line)
 
 int main()
 {
-    char buf[24];
+    char buf[64];
     format_log_time(buf, sizeof(buf));
     assert(std::string(buf) == "+42s ");
     fake_now = 1763303405;  // 2025-11-16 14:30:05 UTC
