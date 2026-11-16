@@ -9,6 +9,9 @@
 
 #include <array>
 #include <atomic>
+#include <time.h>
+
+#include "esp_timer.h"
 
 #include "esp_attr.h"
 #include "esp_system.h"
@@ -29,6 +32,28 @@ static uint32_t s_seq = 0;
 static std::atomic<uint32_t> s_seq_mirror{0};
 static size_t s_count = 0;
 static size_t s_next = 0;
+static std::atomic<int> s_tz_offset_min{480};
+
+void idf_log_set_tz_offset_min(int minutes)
+{
+    if (minutes < -12 * 60 || minutes > 14 * 60) return;
+    s_tz_offset_min.store(minutes, std::memory_order_relaxed);
+}
+
+// 行首时间：NTP 已校时用“月-日 时:分:秒”，否则用开机后秒数“+123s”
+static void format_log_time(char* buf, size_t size)
+{
+    time_t now = time(nullptr);
+    if (now > 1704067200) {  // 2024-01-01 之后才视为已校时
+        time_t shifted = now + static_cast<time_t>(s_tz_offset_min.load(std::memory_order_relaxed)) * 60;
+        struct tm tmv = {};
+        gmtime_r(&shifted, &tmv);
+        snprintf(buf, size, "%02d-%02d %02d:%02d:%02d ", tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour,
+                 tmv.tm_min, tmv.tm_sec);
+    } else {
+        snprintf(buf, size, "+%llus ", static_cast<unsigned long long>(esp_timer_get_time() / 1000000LL));
+    }
+}
 
 // ---- 上次运行日志(重启前镜像) ----
 // 日志同时写入一块 .noinit RAM 字节环。软件复位/看门狗复位/panic 都不会清
@@ -302,6 +327,9 @@ void idf_log_line(const char* line)
         item.resize(end);
         item += "...";
     }
+    char stamp[24];
+    format_log_time(stamp, sizeof(stamp));
+    item.insert(0, stamp);
 
     if (xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     prev_ring_append(item.data(), item.size());
@@ -394,6 +422,35 @@ std::string idf_log_text_dump(void)
     }
     xSemaphoreGive(s_log_mutex);
     return out;
+}
+
+uint32_t idf_log_current_seq(void)
+{
+    return s_seq_mirror.load(std::memory_order_relaxed);
+}
+
+uint32_t idf_log_collect_since(uint32_t since, size_t max_bytes, std::vector<IdfLogEntry>& out)
+{
+    ensure_init();
+    out.clear();
+    if (!s_log_mutex || xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return since;
+    uint32_t seq = s_seq;
+    size_t count = s_count;
+    size_t start = (s_next + LOG_RING_SIZE - count) % LOG_RING_SIZE;
+    uint32_t oldest = seq >= count ? seq - static_cast<uint32_t>(count) + 1 : 1;
+    if (since > seq) since = 0;
+    size_t first = since >= oldest ? static_cast<size_t>(since - oldest) + 1 : 0;
+    uint32_t last = since;
+    size_t bytes = 0;
+    for (size_t i = first; i < count; ++i) {
+        const std::string& line = s_lines[(start + i) % LOG_RING_SIZE];
+        if (!out.empty() && bytes + line.size() > max_bytes) break;
+        bytes += line.size();
+        last = oldest + static_cast<uint32_t>(i);
+        out.push_back({last, line});
+    }
+    xSemaphoreGive(s_log_mutex);
+    return last;
 }
 
 bool idf_log_has_prev(void)

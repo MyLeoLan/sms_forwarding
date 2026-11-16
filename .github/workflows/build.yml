@@ -28,6 +28,8 @@ jobs:
         run: |
           python tools/test_modem_refresh.py
           python tools/test_modem_reset_backoff.py
+          python tools/test_cereg_detail.py
+          python tools/test_log_upload.py
           python tools/test_sim_credentials.py
           python tools/test_modem_uart.py
           python tools/test_cellular_http.py

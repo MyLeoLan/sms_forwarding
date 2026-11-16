@@ -1076,6 +1076,91 @@ static bool parse_cereg(const std::string& resp, int& stat)
     return true;
 }
 
+// AT+CEREG=3 时的查询响应（27.007 §10.1.22）：
+// +CEREG: <n>,<stat>[,[<tac>],[<ci>],[<AcT>][,<cause_type>,<reject_cause>]]
+// 缺省/空字段记 -1。TAC/CI 属于位置信息，只解析、不进日志。
+struct CeregDetail {
+    int n = -1;
+    int stat = -1;
+    int act = -1;
+    int cause_type = -1;
+    int reject_cause = -1;
+};
+
+static bool parse_cereg_detail(const std::string& resp, CeregDetail& out)
+{
+    out = CeregDetail{};
+    size_t p = resp.find("+CEREG:");
+    if (p == std::string::npos) return false;
+    std::string line = line_containing(resp, p);
+    size_t start = line.find("+CEREG:");
+    if (start == std::string::npos) return false;
+    std::string rest = line.substr(start + strlen("+CEREG:"));
+    int values[7] = {-1, -1, -1, -1, -1, -1, -1};
+    size_t field = 0, pos = 0;
+    while (field < 7) {
+        size_t comma = rest.find(',', pos);
+        std::string token = idf_util_trim_copy(rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+        long value = -1;
+        // 第 2/3 字段是带引号的十六进制 TAC/CI，跳过
+        if (field != 2 && field != 3 && !token.empty()) {
+            if (!parse_long_token(token, value) || value < 0 || value > 255) return false;
+            values[field] = static_cast<int>(value);
+        }
+        ++field;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    if (values[0] < 0 || values[1] < 0) return false;
+    out.n = values[0];
+    out.stat = values[1];
+    out.act = values[4];
+    out.cause_type = values[5];
+    out.reject_cause = values[6];
+    return true;
+}
+
+static const char* cereg_stat_text(int stat)
+{
+    switch (stat) {
+        case 0: return "未注册且未在搜网";
+        case 1: return "已注册本地网";
+        case 2: return "搜网中";
+        case 3: return "注册被拒绝";
+        case 4: return "未知";
+        case 5: return "已注册漫游";
+        default: return "非标准值";
+    }
+}
+
+// 24.301 附录 A 常见 EMM 原因
+static const char* emm_cause_text(int cause)
+{
+    switch (cause) {
+        case 2: return "IMSI 不被网络识别";
+        case 3: return "非法终端(鉴权失败)";
+        case 5: return "IMEI 不被接受";
+        case 6: return "非法设备";
+        case 7: return "不允许 EPS 业务";
+        case 8: return "不允许 EPS 与非 EPS 业务";
+        case 9: return "网络无法识别终端身份";
+        case 10: return "被网络隐式分离";
+        case 11: return "不允许接入该 PLMN";
+        case 12: return "不允许接入该跟踪区";
+        case 13: return "该跟踪区不允许漫游";
+        case 14: return "该 PLMN 不允许 EPS 业务";
+        case 15: return "跟踪区内无合适小区";
+        case 17: return "网络故障";
+        case 18: return "CS 域不可用";
+        case 19: return "ESM 失败";
+        case 22: return "网络拥塞";
+        case 25: return "不允许接入该 CSG";
+        case 35: return "请求的业务未授权";
+        case 111: return "协议错误";
+        default: return "其他";
+    }
+}
+
 // 只接受独立的 COPS 查询行；空名称合法，格式未知时绝不猜测或改写模组状态。
 static bool parse_cops(const std::string& resp, int& format, std::string& oper)
 {
@@ -2480,6 +2565,52 @@ static int query_cfun_mode(void)
     return atoi(s);
 }
 
+// 掉网诊断：记录注册状态、接入技术和网络给出的拒绝原因，以及 AT+CEER 的最后错误。
+// 临时切到 CEREG=3 才能查到拒绝原因，查完恢复固件默认的 2。全局 30 秒限流。
+static void log_reject_diagnostics(const char* trigger, int cfun_mode = -2)
+{
+    static int64_t s_last_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    if (s_last_us != 0 && now_us - s_last_us < 30LL * 1000000LL) return;
+    s_last_us = now_us;
+
+    if (cfun_mode == -2) cfun_mode = query_cfun_mode();
+    std::string resp;
+    bool detail_mode = send_ok("AT+CEREG=3", 1200);
+    CeregDetail detail;
+    bool got = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg_detail(resp, detail);
+    if (detail_mode) send_ok("AT+CEREG=2", 1200);
+
+    std::string ceer;
+    std::string ceer_resp;
+    if (send_ok("AT+CEER", 1500, &ceer_resp)) {
+        size_t p = ceer_resp.find("+CEER:");
+        if (p != std::string::npos) {
+            std::string line = line_containing(ceer_resp, p);
+            size_t at = line.find("+CEER:");
+            ceer = idf_util_trim_copy(at == std::string::npos ? line : line.substr(at + strlen("+CEER:")));
+            if (ceer.size() > 80) ceer.resize(80);
+        }
+    }
+    if (ceer.empty()) ceer = "无";
+
+    if (!got) {
+        idf_logf("掉网诊断[%s]: CFUN=%d，CEREG 查询失败，CEER=%s", trigger, cfun_mode, ceer.c_str());
+        return;
+    }
+    if (detail.reject_cause >= 0) {
+        idf_logf("掉网诊断[%s]: CFUN=%d 注册=%d(%s) AcT=%d 拒绝类型=%d 原因=%d(%s) CEER=%s", trigger,
+                 cfun_mode, detail.stat, cereg_stat_text(detail.stat), detail.act, detail.cause_type,
+                 detail.reject_cause,
+                 detail.cause_type == 0 ? emm_cause_text(detail.reject_cause) : "厂商自定义",
+                 ceer.c_str());
+    } else {
+        idf_logf("掉网诊断[%s]: CFUN=%d 注册=%d(%s) AcT=%d 无拒绝原因%s CEER=%s", trigger, cfun_mode,
+                 detail.stat, cereg_stat_text(detail.stat), detail.act,
+                 detail_mode ? "" : "(模组不支持 CEREG=3)", ceer.c_str());
+    }
+}
+
 // 射频守护：模组自发落入 CFUN=0 时拉回全功能。返回 true 表示执行了恢复。
 // 只处理 0：CFUN=4 是用户在网页主动开启的飞行模式，不能被自动撤销。
 static bool recover_radio_if_minimum(void)
@@ -2487,6 +2618,7 @@ static bool recover_radio_if_minimum(void)
     static uint32_t s_cfun_recover_count = 0;
     int mode = query_cfun_mode();
     if (mode != 0) return false;
+    log_reject_diagnostics("射频被关闭", mode);
     ++s_cfun_recover_count;
     idf_logf("检测到模组射频被关闭(CFUN=0，第 %u 次)，自动恢复 CFUN=1",
              static_cast<unsigned>(s_cfun_recover_count));
@@ -2916,6 +3048,7 @@ static void modem_task(void*)
                         set_phase(post_register_done ? "ready" : "sampling");
                     }
                 } else {
+                    if (registered) log_reject_diagnostics("注册丢失");
                     registered = false;
                     post_register_done = false;
                     sms_reconfigure_pending = true;
@@ -2925,7 +3058,10 @@ static void modem_task(void*)
                         dereg_count = 0;
                     } else if (++dereg_count >= 60) {
                         dereg_count = 0;
+                        log_reject_diagnostics("持续未注册约5分钟");
                         request_auto_hard_reset("模组长时间未注册网络");
+                    } else if (dereg_count == 12) {
+                        log_reject_diagnostics("未注册约1分钟");
                     }
                 }
             } else if (recover_radio_if_minimum()) {
@@ -2935,6 +3071,7 @@ static void modem_task(void*)
                 last_cfun_guard = now;
             } else if (++health_fail_count >= 3) {
                 health_fail_count = 0;
+                log_reject_diagnostics("健康探测连续失败");
                 request_auto_hard_reset("模组健康探测连续失败");
             }
         }
@@ -2963,6 +3100,7 @@ static void modem_task(void*)
             boot_recovery_used = true;
             idf_log_line("开机 90 秒未注册网络，自动软重启模组");
             log_registration_diagnostics();
+            log_reject_diagnostics("开机90秒未注册");
             s_reset_request.store(1, std::memory_order_relaxed);
         }
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。

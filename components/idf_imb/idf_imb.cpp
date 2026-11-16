@@ -1,11 +1,16 @@
 #include "idf_imb.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+
 #include <string>
+#include <vector>
 
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,6 +35,10 @@ static constexpr int RESULT_REPORT_ATTEMPTS = 3;
 // 每 20 次轮询（约 5 分钟）上报一次设备状态
 static constexpr int HEARTBEAT_EVERY_POLLS = 20;
 static constexpr int MODEM_VALUE_UNKNOWN = 999;
+// 日志上报：每批不超过 3KB，每轮最多 3 批；IMB 不认该接口（旧版 404）时 1 小时后再试
+static constexpr size_t LOG_UPLOAD_MAX_BYTES = 3072;
+static constexpr int LOG_UPLOAD_BATCHES_PER_POLL = 3;
+static constexpr int64_t LOG_UPLOAD_UNSUPPORTED_RETRY_US = 3600LL * 1000000LL;
 
 // 复用同一条 TLS 连接：每 15 秒重新握手既耗 CPU，又会持续消耗和打碎堆，
 // 把为低频推送设计的内存余量拖垮。只走 WiFi，轮询走蜂窝会持续消耗卡上流量。
@@ -210,6 +219,51 @@ static void send_heartbeat(const IdfImbEndpoint& ep)
     }
 }
 
+// 把设备日志增量同步到 IMB（服务端每张卡只保留最近 300 条）。
+// boot 是每次开机随机生成的标识，IMB 用 (boot, seq) 去重，重传不会产生重复行。
+// 失败只走 ESP_LOGW：写进设备日志会产生新日志，形成“上报失败→再上报”的循环。
+static uint32_t s_log_boot_id = 0;
+static uint32_t s_log_sent_seq = 0;
+static int64_t s_log_retry_after_us = 0;
+
+static void upload_logs(const IdfImbEndpoint& ep)
+{
+    if (esp_timer_get_time() < s_log_retry_after_us) return;
+    if (s_log_boot_id == 0) s_log_boot_id = esp_random() | 1U;
+    std::vector<IdfLogEntry> lines;
+    for (int batch = 0; batch < LOG_UPLOAD_BATCHES_PER_POLL; ++batch) {
+        uint32_t last = idf_log_collect_since(s_log_sent_seq, LOG_UPLOAD_MAX_BYTES, lines);
+        if (lines.empty()) {
+            s_log_sent_seq = last;
+            return;
+        }
+        std::string json;
+        json.reserve(LOG_UPLOAD_MAX_BYTES + lines.size() * 24 + 48);
+        char head[48];
+        snprintf(head, sizeof(head), "{\"boot\":\"%08" PRIx32 "\",\"lines\":[", s_log_boot_id);
+        json += head;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i) json += ",";
+            json += "{\"seq\":" + std::to_string(lines[i].seq) + ",\"text\":\"" +
+                    idf_imb_json_escape(lines[i].text) + "\"}";
+        }
+        json += "]}";
+        lines.clear();
+        std::string body;
+        int status = 0;
+        if (!http_request(ep.base + "/api/v1/sim-sms/logs", ep.token, &json, body, status)) return;
+        if (status == 404) {
+            s_log_retry_after_us = esp_timer_get_time() + LOG_UPLOAD_UNSUPPORTED_RETRY_US;
+            return;
+        }
+        if (status < 200 || status >= 300) {
+            ESP_LOGW(TAG, "log upload failed, status=%d", status);
+            return;
+        }
+        s_log_sent_seq = last;
+    }
+}
+
 static void handle_task(const IdfImbEndpoint& ep, const IdfImbTask& task)
 {
     idf_logf("IMB 发件任务: 目标 %s，长度 %u", task.phone.c_str(),
@@ -278,6 +332,7 @@ static void imb_task(void*)
             delay_ms = UNAUTHORIZED_RECHECK_MS;
             continue;
         }
+        idf_log_set_tz_offset_min(idf_config_get_tz_offset());
 
         // 信号平时不采样：提前一轮请求刷新，下一轮再发，上报的才是新值
         if (polls_until_heartbeat == 1) idf_modem_note_status_interest();
@@ -288,7 +343,10 @@ static void imb_task(void*)
             --polls_until_heartbeat;
         }
 
-        if (status != 200 || body.empty()) continue;
+        if (status != 200 || body.empty()) {
+            upload_logs(ep);
+            continue;
+        }
 
         IdfImbTask task;
         if (!idf_imb_parse_task(body, task) || !idf_imb_task_id_valid(task.id)) {
