@@ -22,6 +22,7 @@ def function(name):
 code = '\n\n'.join([
     function('static bool parse_long_token('),
     function('static std::string line_containing('),
+    function('static bool parse_cereg('),
     span('struct CeregDetail {', '// 只接受独立的 COPS 查询行'),
 ])
 fixture = (ROOT / 'tests/cereg_detail_test.cpp').read_text().replace('// @真实函数@', code)

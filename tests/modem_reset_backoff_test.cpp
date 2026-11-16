@@ -54,6 +54,15 @@ int main()
     int before = log_count;
     for (int i = 0; i < 10; ++i) { fake_us += 1000000; assert(!fire()); }
     assert(log_count - before == 1);
+    // 软重启与硬重启共用退避：清零后第一次软重启立即允许，紧接着的硬重启要等 2 分钟
+    note_registration_ok_for_auto_reset();
+    fake_us += 1000000;
+    s_reset_request.store(0);
+    assert(request_auto_reset("掉卡", 1) && s_reset_request.load() == 1);
+    fake_us += 1000000;
+    assert(!fire());
+    fake_us += 121LL * 1000000;
+    assert(fire());
     std::cout << "modem reset backoff tests passed" << std::endl;
     return 0;
 }

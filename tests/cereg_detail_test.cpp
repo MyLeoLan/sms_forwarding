@@ -29,7 +29,14 @@ int main()
     assert(!parse_cereg_detail("OK", d));
     assert(!parse_cereg_detail("+CEREG: x,1", d));
     assert(!parse_cereg_detail("+CEREG: 3", d));
-    assert(std::string(cereg_stat_text(3)) == "注册被拒绝" && std::string(cereg_stat_text(9)) == "非标准值");
+    assert(std::string(cereg_stat_text(3)) == "注册被拒绝" && std::string(cereg_stat_text(12)) == "非标准值");
+    // 27.007 合法状态 0..11 都要接受（11 = RLOS 受限附着，读不到 SIM 时常见）
+    int stat = -1;
+    assert(parse_cereg("+CEREG: 2,11,\"7C1D\",\"0054D504\",7\r\nOK", stat) && stat == 11);
+    assert(parse_cereg("+CEREG: 2,1\r\nOK", stat) && stat == 1);
+    assert(parse_cereg("+CEREG: 8\r\n", stat) && stat == 8);
+    assert(!parse_cereg("+CEREG: 2,12\r\nOK", stat));
+    assert(std::string(cereg_stat_text(11)).find("RLOS") != std::string::npos);
     std::cout << "cereg detail tests passed" << std::endl;
     return 0;
 }

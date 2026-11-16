@@ -1071,7 +1071,9 @@ static bool parse_cereg(const std::string& resp, int& stat)
         // 后者第二字段通常是带引号的 TAC，不能把它当注册状态。
         if (parse_long_token(second, second_value)) status_value = second_value;
     }
-    if (status_value < 0 || status_value > 5) return false;
+    // 27.007 定义 0..11：6/7 仅短信、8 仅紧急承载、9/10 不推荐 CSFB、11 RLOS 受限附着。
+    // 合法值都要接受，只有 1/5 算正常注册；否则会把“未注册”误当查询失败去硬重启。
+    if (status_value < 0 || status_value > 11) return false;
     stat = static_cast<int>(status_value);
     return true;
 }
@@ -1129,6 +1131,12 @@ static const char* cereg_stat_text(int stat)
         case 3: return "注册被拒绝";
         case 4: return "未知";
         case 5: return "已注册漫游";
+        case 6: return "仅短信(本地)";
+        case 7: return "仅短信(漫游)";
+        case 8: return "仅紧急承载";
+        case 9: return "已注册本地网(不推荐CSFB)";
+        case 10: return "已注册漫游(不推荐CSFB)";
+        case 11: return "受限附着(RLOS，多为读不到SIM)";
         default: return "非标准值";
     }
 }
@@ -2665,8 +2673,8 @@ static void note_registration_ok_for_auto_reset(void)
     s_auto_reset_streak = 0;
 }
 
-// 返回 true 表示已请求硬重启；false 表示处于退避期，本次跳过
-static bool request_auto_hard_reset(const char* reason)
+// 返回 true 表示已请求重启；false 表示处于退避期，本次跳过。kind: 1=AT 软重启 2=EN 硬重启
+static bool request_auto_reset(const char* reason, int kind)
 {
     int64_t now_us = esp_timer_get_time();
     int64_t gap_us = static_cast<int64_t>(auto_reset_gap_ms(s_auto_reset_streak)) * 1000LL;
@@ -2682,9 +2690,14 @@ static bool request_auto_hard_reset(const char* reason)
     }
     ++s_auto_reset_streak;
     s_last_auto_reset_us = now_us;
-    idf_logf("%s，触发硬重启恢复（连续第 %d 次）", reason, s_auto_reset_streak);
-    s_reset_request.store(2, std::memory_order_relaxed);
+    idf_logf("%s，触发%s恢复（连续第 %d 次）", reason, kind == 1 ? "软重启" : "硬重启", s_auto_reset_streak);
+    s_reset_request.store(kind == 1 ? 1 : 2, std::memory_order_relaxed);
     return true;
+}
+
+static bool request_auto_hard_reset(const char* reason)
+{
+    return request_auto_reset(reason, 2);
 }
 
 static bool handle_reset_request_if_any(void)
@@ -2868,6 +2881,7 @@ static void modem_task(void*)
     TickType_t last_sim_check = 0;
     int64_t sim_check_not_before_us = 0;  // 模组重启后给 SIM/CPIN 充分上电时间，避免误判二次拔插
     int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
+    int sim_present_candidate = -1;  // 读到与基线不同的值时先记候选，3 秒后复核一致才算插拔
     bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
     bool sim_config_pending = false;       // SIM 经采样路径转为就绪时，仍需补跑完整初始化
     bool boot_recovery_used = false;       // 开机未注册的自动软重启只做一次
@@ -2900,6 +2914,7 @@ static void modem_task(void*)
             last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
+            sim_present_candidate = -1;
             sms_reconfigure_pending = true;
         }
         int unlock_request = s_sim_unlock_request.exchange(0, std::memory_order_relaxed);
@@ -3121,9 +3136,24 @@ static void modem_task(void*)
                     sms_reconfigure_pending = true;
                     last_health = 0;
                 }
+            } else if (sim_present == -1 && present_now == 0 && sim_ready) {
+                // 本轮启动 SIM 已就绪过、首次检测却读到无卡：多半是刚掉卡。基线按有卡记，
+                // 交给去抖复核，确认后走“运行中掉线”自动软重启，而不是把无卡当基线永远不恢复
+                sim_present = 1;
+                sim_present_candidate = 0;
+                last_sim_check = now - pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS) + pdMS_TO_TICKS(3000);
             } else if (sim_present == -1) {
                 sim_present = present_now;  // 首次仅记基线，不当作插拔事件
-            } else if (present_now != sim_present) {
+                sim_present_candidate = -1;
+            } else if (present_now == sim_present) {
+                sim_present_candidate = -1;
+            } else if (sim_present_candidate != present_now) {
+                // 去抖：SIM 接触不良时 CPIN 会瞬间回 CME ERROR 10，单次读数不作数，3 秒后复核
+                sim_present_candidate = present_now;
+                last_sim_check = now - pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS) + pdMS_TO_TICKS(3000);
+            } else {
+                sim_present_candidate = -1;
+                const bool was_present = sim_present == 1;
                 sim_present = present_now;
                 if (present_now == 0 && recover_radio_if_minimum()) {
                     // CFUN=0 会给 SIM 下电，部分固件此时回 CME ERROR 10；拉回射频后由下一轮
@@ -3153,6 +3183,9 @@ static void modem_task(void*)
                     idf_modem_invalidate_sim_identity();
                     set_sim_status("absent", false, "未检测到 SIM");
                     set_phase("registering");
+                    // 运行中“掉卡”多为卡座接触不良：AT+CFUN=1,1 重新初始化 SIM 接口通常即可读回；
+                    // 真拔卡时重启后基线记为无卡，不会再触发。与其他自动重启共用退避。
+                    if (was_present) request_auto_reset("SIM 卡运行中掉线", 1);
                 }
             }
         }
